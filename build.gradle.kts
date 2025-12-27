@@ -26,6 +26,11 @@ dependencies {
     val ktorVersion = "2.3.11"
     implementation("io.ktor:ktor-network:$ktorVersion")
     implementation("io.ktor:ktor-network-tls:$ktorVersion")
+    
+    // Ktor Server per lo streaming web
+    implementation("io.ktor:ktor-server-core:$ktorVersion")
+    implementation("io.ktor:ktor-server-netty:$ktorVersion")
+    implementation("io.ktor:ktor-server-websockets:$ktorVersion")
 
     // Per la gestione delle coroutine (necessario per Ktor e operazioni asincrone)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")

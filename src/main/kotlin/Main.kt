@@ -29,6 +29,7 @@ import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress as JInetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import javax.sound.sampled.*
@@ -67,178 +68,30 @@ data class AudioSettings_V1(
 
 object NetworkHandler_v1 {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var streamingJob: Job? = null
-    private var listeningJob: Job? = null
-    private var broadcastingJob: Job? = null
-    private var serverAudioLine: TargetDataLine? = null
-    private var micReceiverJob: Job? = null
+    private lateinit var core: StreamingCore
 
-    private const val DISCOVERY_PORT = 9091
-    private const val CLIENT_HELLO_MESSAGE = "HELLO_FROM_CLIENT"
-    private const val MULTICAST_GROUP_IP = "239.255.0.1"
-    private const val DISCOVERY_MESSAGE = "WIFI_AUDIO_STREAMER_DISCOVERY"
-
-    fun findAvailableOutputMixers(): List<Mixer.Info> {
-        return AudioSystem.getMixerInfo()
-            .filter { mixerInfo ->
-                !mixerInfo.name.startsWith("Port", ignoreCase = true) &&
-                        AudioSystem.getMixer(mixerInfo).isLineSupported(Line.Info(SourceDataLine::class.java))
-            }
+    init {
+        core = StreamingCore(scope)
     }
 
-    fun findAvailableInputMixers(): List<Mixer.Info> {
-        return AudioSystem.getMixerInfo()
-            .filter { mixerInfo ->
-                !mixerInfo.name.startsWith("Port", ignoreCase = true) &&
-                        AudioSystem.getMixer(mixerInfo).isLineSupported(Line.Info(TargetDataLine::class.java))
-            }
-    }
+    fun findAvailableOutputMixers(): List<Mixer.Info> = StreamingCore.findAvailableOutputMixers()
+    fun findAvailableInputMixers(): List<Mixer.Info> = StreamingCore.findAvailableInputMixers()
 
-    // ... Le funzioni beginDeviceDiscovery, endDeviceDiscovery, etc. rimangono invariate ...
     fun beginDeviceDiscovery(onDeviceFound: (hostname: String, serverInfo: ServerInfo) -> Unit) {
-        if (listeningJob?.isActive == true) return
-        listeningJob = scope.launch {
-            var socket: MulticastSocket? = null
-            try {
-                val localIps = NetworkInterface.getNetworkInterfaces().toList()
-                    .flatMap { it.inetAddresses.toList() }
-                    .map { it.hostAddress }
-                    .toSet()
-
-                val groupAddress = InetAddress.getByName(MULTICAST_GROUP_IP)
-                socket = MulticastSocket(DISCOVERY_PORT).apply {
-                    joinGroup(groupAddress)
-                    soTimeout = 5000
-                }
-
-                val buffer = ByteArray(1024)
-                val packet = DatagramPacket(buffer, buffer.size)
-
-                while (isActive) {
-                    try {
-                        socket.receive(packet)
-                        val remoteIp = packet.address.hostAddress
-                        val message = String(packet.data, 0, packet.length).trim()
-
-                        if (remoteIp != null && remoteIp !in localIps && message.startsWith(DISCOVERY_MESSAGE)) {
-                            val parts = message.split(";")
-                            if (parts.size == 4) {
-                                val hostname = parts[1]
-                                val isMulticast = parts[2].equals("MULTICAST", ignoreCase = true)
-                                val port = parts[3].toIntOrNull() ?: continue
-                                onDeviceFound(hostname, ServerInfo(remoteIp, isMulticast, port))
-                            }
-                        }
-                    } catch (e: java.net.SocketTimeoutException) {
-                        continue
-                    }
-                }
-            } catch (e: Exception) {
-                if (e !is CancellationException) println("Listening Error: ${e.message}")
-            } finally {
-                socket?.leaveGroup(InetAddress.getByName(MULTICAST_GROUP_IP))
-                socket?.close()
-            }
-        }
+        core.beginDeviceDiscovery(onDeviceFound)
     }
 
     fun endDeviceDiscovery() {
-        listeningJob?.cancel()
+        core.endDeviceDiscovery()
     }
 
     fun startAnnouncingPresence(isMulticast: Boolean, port: Int) {
-        broadcastingJob?.cancel()
-        broadcastingJob = scope.launch {
-            val hostname = try { InetAddress.getLocalHost().hostName } catch (e: Exception) { "Desktop-PC" }
-            val mode = if (isMulticast) "MULTICAST" else "UNICAST"
-            val message = "$DISCOVERY_MESSAGE;$hostname;$mode;$port"
-
-            DatagramSocket().use { socket ->
-                val groupAddress = InetAddress.getByName(MULTICAST_GROUP_IP)
-                while (isActive) {
-                    val packet = DatagramPacket(message.toByteArray(), message.length, groupAddress, DISCOVERY_PORT)
-                    socket.send(packet)
-                    delay(3000)
-                }
-            }
-        }
+        core.startAnnouncingPresence(isMulticast, port)
     }
 
     fun stopAnnouncingPresence() {
-        broadcastingJob?.cancel()
+        core.stopAnnouncingPresence()
     }
-
-    private fun CoroutineScope.launchMicReceiver(
-        audioSettings: AudioSettings_V1, isMulticast: Boolean, micOutputMixerInfo: Mixer.Info, micPort: Int
-    ) = launch {
-        var socket: DatagramSocket? = null
-        val micMixer = AudioSystem.getMixer(micOutputMixerInfo)
-        val format = audioSettings.toAudioFormat()
-        val lineInfo = DataLine.Info(SourceDataLine::class.java, format)
-        if (!micMixer.isLineSupported(lineInfo)) return@launch
-
-        val micOutputLine = micMixer.getLine(lineInfo) as SourceDataLine
-        micOutputLine.open(format, audioSettings.bufferSize * 4)
-        micOutputLine.start()
-
-        try {
-            val buffer = ByteArray(audioSettings.bufferSize * 2)
-            val packet = DatagramPacket(buffer, buffer.size)
-
-            socket = if (isMulticast) {
-                MulticastSocket(micPort).apply { joinGroup(InetAddress.getByName(MULTICAST_GROUP_IP)) }
-            } else {
-                DatagramSocket(micPort)
-            }
-
-            while (isActive) {
-                socket.receive(packet)
-                if (packet.length > 0) micOutputLine.write(packet.data, 0, packet.length)
-            }
-        } catch (e: Exception) {
-            if (e !is CancellationException) println("Mic receiving error: ${e.message}")
-        } finally {
-            socket?.close()
-            micOutputLine.drain(); micOutputLine.stop(); micOutputLine.close()
-        }
-    }
-
-    private fun CoroutineScope.launchMicSender(
-        audioSettings: AudioSettings_V1, serverInfo: ServerInfo, micInputMixerInfo: Mixer.Info, micPort: Int
-    ) = launch {
-        var socket: DatagramSocket? = null
-        val micMixer = AudioSystem.getMixer(micInputMixerInfo)
-        val format = audioSettings.toAudioFormat()
-        val lineInfo = DataLine.Info(TargetDataLine::class.java, format)
-        if (!micMixer.isLineSupported(lineInfo)) return@launch
-
-        val micInputLine = micMixer.getLine(lineInfo) as TargetDataLine
-        micInputLine.open(format, audioSettings.bufferSize)
-        micInputLine.start()
-
-        try {
-            socket = DatagramSocket()
-            val destinationAddress = if (serverInfo.isMulticast) {
-                InetAddress.getByName(MULTICAST_GROUP_IP)
-            } else {
-                InetAddress.getByName(serverInfo.ip)
-            }
-            val buffer = ByteArray(audioSettings.bufferSize)
-            while (isActive) {
-                val bytesRead = micInputLine.read(buffer, 0, buffer.size)
-                if (bytesRead > 0) {
-                    val packet = DatagramPacket(buffer, bytesRead, destinationAddress, micPort)
-                    socket.send(packet)
-                }
-            }
-        } catch (e: Exception) {
-            if (e !is CancellationException) println("Mic sending error: ${e.message}")
-        } finally {
-            socket?.close()
-            micInputLine.stop(); micInputLine.close()
-        }
-    }
-
 
     fun launchServerInstance(
         audioSettings: AudioSettings_V1,
@@ -247,88 +100,9 @@ object NetworkHandler_v1 {
         selectedMixerInfo: Mixer.Info?,
         micOutputMixerInfo: Mixer.Info?,
         micPort: Int,
-        onStatusUpdate: (key: String, args: Array<out Any>) -> Unit // <- CORREZIONE 1: Firma modificata
+        onStatusUpdate: (key: String, args: Array<out Any>) -> Unit
     ) {
-        if (micOutputMixerInfo != null) {
-            micReceiverJob = scope.launchMicReceiver(audioSettings, isMulticast, micOutputMixerInfo, micPort)
-        }
-        startAnnouncingPresence(isMulticast, port)
-        streamingJob = scope.launch {
-            var audioLine: TargetDataLine? = null
-            try {
-                val systemAudioDeviceInfo = selectedMixerInfo ?: run {
-                    onStatusUpdate("status_error_no_device", emptyArray()) // <- CORREZIONE 2: Usa emptyArray()
-                    return@launch
-                }
-                val audioMixer = AudioSystem.getMixer(systemAudioDeviceInfo)
-                val format = audioSettings.toAudioFormat()
-                val lineInfo = DataLine.Info(TargetDataLine::class.java, format)
-                if (!AudioSystem.isLineSupported(lineInfo)) {
-                    onStatusUpdate("status_error_unsupported_format", emptyArray())
-                    return@launch
-                }
-                val frameSize = format.frameSize
-                val adjustedBufferSize = (audioSettings.bufferSize / frameSize) * frameSize
-                if (adjustedBufferSize <= 0) {
-                    onStatusUpdate("status_error_invalid_buffer", emptyArray())
-                    return@launch
-                }
-                audioLine = audioMixer.getLine(lineInfo) as? TargetDataLine
-                serverAudioLine = audioLine
-                audioLine?.open(format, adjustedBufferSize)
-                audioLine?.start()
-                if (audioLine == null || !audioLine.isOpen) {
-                    onStatusUpdate("status_error_critical_line", emptyArray())
-                    serverAudioLine = null
-                    return@launch
-                }
-
-                if (isMulticast) {
-                    onStatusUpdate("status_multicast_streaming", arrayOf(port)) // <- CORREZIONE 3: Usa arrayOf()
-                    MulticastSocket().use { socket ->
-                        val group = InetAddress.getByName(MULTICAST_GROUP_IP)
-                        val buffer = ByteArray(adjustedBufferSize)
-                        while (isActive) {
-                            val bytesRead = audioLine.read(buffer, 0, buffer.size)
-                            if (bytesRead > 0) {
-                                val packet = DatagramPacket(buffer, bytesRead, group, port)
-                                socket.send(packet)
-                            } else if (bytesRead < 0) break
-                        }
-                    }
-                } else { // Unicast
-                    onStatusUpdate("status_server_waiting", arrayOf(port))
-                    val localAddress = InetSocketAddress("0.0.0.0", port)
-                    aSocket(SelectorManager(Dispatchers.IO)).udp().bind(localAddress) { reuseAddress = true }.use { socket ->
-                        val clientDatagram = socket.receive()
-                        if (clientDatagram.packet.readText().trim() == CLIENT_HELLO_MESSAGE) {
-                            val clientAddress = clientDatagram.address
-                            onStatusUpdate("status_client_connected", arrayOf(clientAddress))
-                            stopAnnouncingPresence()
-
-                            val ackPacket = buildPacket { writeText("HELLO_ACK") }
-                            socket.send(Datagram(ackPacket, clientAddress))
-
-                            val buffer = ByteArray(adjustedBufferSize)
-                            while (isActive) {
-                                val bytesRead = audioLine.read(buffer, 0, buffer.size)
-                                if (bytesRead > 0) {
-                                    val packet = buildPacket { writeFully(buffer, 0, bytesRead) }
-                                    socket.send(Datagram(packet, clientAddress))
-                                } else if (bytesRead < 0) break
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (e !is CancellationException) onStatusUpdate("status_error_server", arrayOf(e.message ?: "Unknown"))
-            } finally {
-                stopAnnouncingPresence()
-                onStatusUpdate("status_server_stopped", emptyArray())
-                audioLine?.stop(); audioLine?.close()
-                serverAudioLine = null
-            }
-        }
+        core.launchServerInstance(audioSettings, port, isMulticast, selectedMixerInfo = selectedMixerInfo, micOutputMixerInfo = micOutputMixerInfo, micPort = micPort, onStatusUpdate = onStatusUpdate)
     }
 
     fun launchClientInstance(
@@ -338,86 +112,13 @@ object NetworkHandler_v1 {
         sendMicrophone: Boolean,
         micInputMixerInfo: Mixer.Info?,
         micPort: Int,
-        onStatusUpdate: (key: String, args: Array<out Any>) -> Unit // <- CORREZIONE 1: Firma modificata
+        onStatusUpdate: (key: String, args: Array<out Any>) -> Unit
     ) {
-        if (sendMicrophone && micInputMixerInfo != null) {
-            micReceiverJob = scope.launchMicSender(audioSettings, serverInfo, micInputMixerInfo, micPort)
-        }
-        streamingJob = scope.launch {
-            var sourceDataLine: SourceDataLine? = null
-            try {
-                if (!serverInfo.isMulticast) { // Unicast
-                    val remoteAddress = InetSocketAddress(serverInfo.ip, serverInfo.port)
-                    aSocket(SelectorManager(Dispatchers.IO)).udp().bind().use { socket ->
-                        onStatusUpdate("status_contacting_server", arrayOf(remoteAddress))
-                        val helloPacket = buildPacket { writeText(CLIENT_HELLO_MESSAGE) }
-                        socket.send(Datagram(helloPacket, remoteAddress))
-
-                        onStatusUpdate("status_waiting_ack", emptyArray())
-                        val ackDatagram = withTimeout(5000) { socket.receive() }
-                        if (ackDatagram.packet.readText().trim() != "HELLO_ACK") {
-                            onStatusUpdate("status_handshake_failed", emptyArray())
-                            return@use
-                        }
-
-                        onStatusUpdate("status_connected_streaming_from", arrayOf(remoteAddress))
-                        sourceDataLine = prepareSourceDataLine(selectedMixerInfo, audioSettings)
-                        sourceDataLine?.start()
-
-                        val buffer = ByteArray(audioSettings.bufferSize * 2)
-                        while (isActive) {
-                            val datagram = socket.receive()
-                            val bytesRead = datagram.packet.readAvailable(buffer)
-                            if (bytesRead > 0) sourceDataLine?.write(buffer, 0, bytesRead)
-                        }
-                    }
-                } else { // Multicast
-                    onStatusUpdate("status_joining_multicast", arrayOf(serverInfo.port))
-                    val groupAddress = InetAddress.getByName(MULTICAST_GROUP_IP)
-                    MulticastSocket(serverInfo.port).use { socket ->
-                        socket.joinGroup(groupAddress)
-                        sourceDataLine = prepareSourceDataLine(selectedMixerInfo, audioSettings)
-                        sourceDataLine?.start()
-
-                        onStatusUpdate("status_multicast_streaming", arrayOf(serverInfo.port))
-                        val buffer = ByteArray(audioSettings.bufferSize * 2)
-                        val packet = DatagramPacket(buffer, buffer.size)
-                        while (isActive) {
-                            socket.receive(packet)
-                            if (packet.length > 0) sourceDataLine?.write(packet.data, 0, packet.length)
-                        }
-                    }
-                }
-            } catch (e: TimeoutCancellationException) {
-                onStatusUpdate("status_server_no_response", emptyArray())
-            } catch (e: Exception) {
-                if (e !is CancellationException) onStatusUpdate("status_error_client", arrayOf(e.message ?: "Unknown"))
-            } finally {
-                onStatusUpdate("status_streaming_ended", emptyArray())
-                sourceDataLine?.drain(); sourceDataLine?.stop(); sourceDataLine?.close()
-            }
-        }
-    }
-
-    private fun prepareSourceDataLine(mixerInfo: Mixer.Info, audioSettings: AudioSettings_V1): SourceDataLine? {
-        val mixer = AudioSystem.getMixer(mixerInfo)
-        val format = audioSettings.toAudioFormat()
-        val dataLineInfo = DataLine.Info(SourceDataLine::class.java, format)
-        if (!mixer.isLineSupported(dataLineInfo)) return null
-
-        val frameSize = format.frameSize
-        val adjustedBufferSize = (audioSettings.bufferSize / frameSize) * frameSize
-        val sourceDataLine = mixer.getLine(dataLineInfo) as SourceDataLine
-        sourceDataLine.open(format, adjustedBufferSize * 4)
-        return sourceDataLine
+        core.launchClientInstance(audioSettings, serverInfo, selectedMixerInfo, sendMicrophone, micInputMixerInfo, micPort, onStatusUpdate)
     }
 
     suspend fun stopCurrentStream() {
-        stopAnnouncingPresence()
-        streamingJob?.cancelAndJoin()
-        micReceiverJob?.cancelAndJoin()
-        serverAudioLine?.stop(); serverAudioLine?.close()
-        streamingJob = null; micReceiverJob = null; serverAudioLine = null
+        core.stopCurrentStream()
     }
 
     fun terminateAllServices() {
@@ -761,41 +462,50 @@ fun NetworkSettingsPanel(
 }
 */
 
-fun main() = application {
-    val loadedSettings = SettingsRepository.loadSettings()
-    var appSettings by remember { mutableStateOf(loadedSettings.app) }
-    var audioSettings by remember { mutableStateOf(loadedSettings.audio) }
-    var streamingPort by remember { mutableStateOf(loadedSettings.streamingPort) }
-    var micPort by remember { mutableStateOf(loadedSettings.micPort) }
-
-    LaunchedEffect(appSettings, audioSettings, streamingPort, micPort) {
-        SettingsRepository.saveSettings(AllSettings(appSettings, audioSettings, streamingPort, micPort))
+fun main(args: Array<String>) {
+    if (args.contains("--service") || args.contains("-s")) {
+        ServiceMode.start()
+        return
     }
 
-    var showSettings by remember { mutableStateOf(false) }
-    var isServer by remember { mutableStateOf(true) }
-    val discoveredDevices = remember { mutableStateMapOf<String, ServerInfo>() }
-    var connectionStatus by remember { mutableStateOf(Strings.get("status_inactive")) }
-    var isStreaming by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
+    application {
+        val loadedSettings = SettingsRepository.loadSettings()
+        var appSettings by remember { mutableStateOf(loadedSettings.app) }
+        var audioSettings by remember { mutableStateOf(loadedSettings.audio) }
+        var streamingPort by remember { mutableStateOf(loadedSettings.streamingPort) }
+        var micPort by remember { mutableStateOf(loadedSettings.micPort) }
 
-    val outputDevices = remember { mutableStateOf<List<Mixer.Info>>(emptyList()) }
-    var selectedOutputDevice by remember { mutableStateOf<Mixer.Info?>(null) }
-    val inputDevices = remember { mutableStateOf<List<Mixer.Info>>(emptyList()) }
-    var selectedInputDevice by remember { mutableStateOf<Mixer.Info?>(null) }
-    var sendMicrophone by remember { mutableStateOf(false) }
-    var selectedClientMic by remember { mutableStateOf<Mixer.Info?>(null) }
-    var selectedServerMicOutput by remember { mutableStateOf<Mixer.Info?>(null) }
-    var isMulticastMode by remember { mutableStateOf(true) }
+        LaunchedEffect(appSettings, audioSettings, streamingPort, micPort) {
+            SettingsRepository.saveSettings(AllSettings(appSettings, audioSettings, streamingPort, micPort))
+        }
 
-    LaunchedEffect(Unit) {
-        outputDevices.value = NetworkHandler_v1.findAvailableOutputMixers()
-        inputDevices.value = NetworkHandler_v1.findAvailableInputMixers()
-        selectedOutputDevice = outputDevices.value.firstOrNull()
-        selectedInputDevice = inputDevices.value.firstOrNull()
-        selectedClientMic = inputDevices.value.firstOrNull()
-        selectedServerMicOutput = outputDevices.value.find { it.name.contains("CABLE Input", ignoreCase = true) } ?: outputDevices.value.firstOrNull()
-    }
+        var showSettings by remember { mutableStateOf(false) }
+        var isServer by remember { mutableStateOf(true) }
+        val discoveredDevices = remember { mutableStateMapOf<String, ServerInfo>() }
+        var connectionStatus by remember { mutableStateOf(Strings.get("status_inactive")) }
+        var isStreaming by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+
+        val outputDevices = remember { mutableStateOf<List<Mixer.Info>>(emptyList()) }
+        var selectedOutputDevice by remember { mutableStateOf<Mixer.Info?>(null) }
+        val inputDevices = remember { mutableStateOf<List<Mixer.Info>>(emptyList()) }
+        var selectedInputDevice by remember { mutableStateOf<Mixer.Info?>(null) }
+        var sendMicrophone by remember { mutableStateOf(false) }
+        var selectedClientMic by remember { mutableStateOf<Mixer.Info?>(null) }
+        var selectedServerMicOutput by remember { mutableStateOf<Mixer.Info?>(null) }
+        var isMulticastMode by remember { mutableStateOf(true) }
+
+        LaunchedEffect(Unit) {
+            outputDevices.value = NetworkHandler_v1.findAvailableOutputMixers()
+            inputDevices.value = NetworkHandler_v1.findAvailableInputMixers()
+            selectedOutputDevice = outputDevices.value.firstOrNull()
+            selectedInputDevice = inputDevices.value.firstOrNull()
+            selectedClientMic = inputDevices.value.firstOrNull()
+            selectedServerMicOutput = outputDevices.value.find { it.name.contains("CABLE Input", ignoreCase = true) } ?: outputDevices.value.firstOrNull()
+
+            // Automatically setup firewall in GUI mode as well
+            FirewallManager.setupFirewall()
+        }
 
     val useDarkTheme = when (appSettings.theme) {
         Theme.Light -> false
@@ -912,6 +622,7 @@ fun main() = application {
             }
         }
     }
+}
 }
 
 @Composable

@@ -1,0 +1,32 @@
+<service>
+  <!-- Windows Service ID. Should be unique on the system -->
+  <id>WiFiAudioStreamingService</id>
+  <!-- Display name of the service -->
+  <name>WiFi Audio Streaming (Headless)</name>
+  <!-- Service description -->
+  <description>Streams PC audio to the network in background without a GUI.</description>
+
+  <!-- Path to the executable. 
+       Adjust this path to where you installed the application. 
+       Example: C:\Program Files\WiFi Audio Streaming\bin\WiFi Audio Streaming.exe 
+  -->
+  <executable>%BASE%\app\WiFi Audio Streaming\WiFi Audio Streaming.exe</executable>
+  
+  <!-- Arguments passed to the executable. We add the service flag to trigger the headless mode -->
+  <arguments>--service</arguments>
+
+  <!-- Log handling -->
+  <log mode="roll"></log>
+
+  <!-- Start mode: Automatic starts the service when Windows boots -->
+  <startmode>Automatic</startmode>
+  
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Restart logic if the service crashes -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="20 sec"/>
+
+  <!-- Priority -->
+  <priority>Normal</priority>
+</service>
